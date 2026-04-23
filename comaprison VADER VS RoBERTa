@@ -1,0 +1,204 @@
+import pandas as pd
+import torch
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from tqdm import tqdm
+from scipy.special import softmax
+
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.model_selection import train_test_split
+
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    RobertaTokenizerFast,
+    RobertaForSequenceClassification,
+    Trainer,
+    TrainingArguments
+)
+
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# -------------------------------
+# LOAD DATA
+# -------------------------------
+df = pd.read_csv("datasetlocation")
+df = df[["Id", "Text", "Score"]].dropna()
+
+# OPTIONAL: reduce size for faster run
+df = df.sample(n=2000, random_state=42)
+
+# -------------------------------
+# TRUE LABELS
+# -------------------------------
+df['True_Sentiment'] = df['Score'].apply(
+    lambda x: 'positive' if x > 3 else ('negative' if x < 3 else 'neutral')
+)
+
+# -------------------------------
+# VADER
+# -------------------------------
+sia = SentimentIntensityAnalyzer()
+
+df['VADER_scores'] = df['Text'].apply(lambda x: sia.polarity_scores(str(x)))
+df['VADER_compound'] = df['VADER_scores'].apply(lambda x: x['compound'])
+
+df['VADER_Sentiment'] = df['VADER_compound'].apply(
+    lambda x: 'positive' if x >= 0.05 else ('negative' if x <= -0.05 else 'neutral')
+)
+
+# -------------------------------
+# BASE ROBERTA
+# -------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+tokenizer = AutoTokenizer.from_pretrained("cardiffnlp/twitter-roberta-base-sentiment")
+base_model = AutoModelForSequenceClassification.from_pretrained(
+    "cardiffnlp/twitter-roberta-base-sentiment"
+).to(device)
+
+labels = ['negative', 'neutral', 'positive']
+
+def roberta_base_sentiment(text):
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+        padding=True
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = base_model(**inputs)
+        scores = torch.nn.functional.softmax(outputs.logits, dim=-1)
+
+    return labels[scores.argmax().item()]
+
+df['RoBERTa_Base'] = df['Text'].apply(roberta_base_sentiment)
+
+# -------------------------------
+# PAIRPLOT DATA (VADER + ROBERTA PROBS)
+# -------------------------------
+def roberta_scores(text):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    with torch.no_grad():
+        outputs = base_model(**inputs)
+        scores = softmax(outputs.logits[0].cpu().numpy())
+    return scores
+
+vader_list = []
+roberta_list = []
+
+for _, row in tqdm(df.iterrows(), total=len(df)):
+    text = row['Text']
+
+    v = sia.polarity_scores(text)
+    r = roberta_scores(text)
+
+    vader_list.append([v['neg'], v['neu'], v['pos']])
+    roberta_list.append(r)
+
+vader_df = pd.DataFrame(vader_list, columns=['vader_neg','vader_neu','vader_pos'])
+roberta_df = pd.DataFrame(roberta_list, columns=['roberta_neg','roberta_neu','roberta_pos'])
+
+pairplot_df = pd.concat([vader_df, roberta_df, df['Score']], axis=1)
+
+# -------------------------------
+# PAIRPLOT
+# -------------------------------
+sns.pairplot(
+    data=pairplot_df,
+    vars=[
+        'vader_neg','vader_neu','vader_pos',
+        'roberta_neg','roberta_neu','roberta_pos'
+    ],
+    hue='Score',
+    palette='tab10'
+)
+
+plt.show()
+
+# -------------------------------
+# FINE-TUNED ROBERTA
+# -------------------------------
+# Prepare binary dataset
+df_ft = df[df["Score"] != 3]
+df_ft["label"] = df_ft["Score"].apply(lambda x: 1 if x >= 4 else 0)
+
+train_df, val_df = train_test_split(df_ft[['Text','label']], test_size=0.2, random_state=42)
+
+train_dataset = Dataset.from_pandas(train_df.reset_index(drop=True))
+val_dataset = Dataset.from_pandas(val_df.reset_index(drop=True))
+
+tokenizer_ft = RobertaTokenizerFast.from_pretrained("roberta-base")
+
+def tokenize(batch):
+    return tokenizer_ft(batch["Text"], padding="max_length", truncation=True, max_length=256)
+
+train_dataset = train_dataset.map(tokenize, batched=True)
+val_dataset = val_dataset.map(tokenize, batched=True)
+
+train_dataset.set_format(type="torch", columns=["input_ids","attention_mask","label"])
+val_dataset.set_format(type="torch", columns=["input_ids","attention_mask","label"])
+
+model_ft = RobertaForSequenceClassification.from_pretrained("roberta-base", num_labels=2)
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = logits.argmax(axis=1)
+    return {"accuracy": accuracy_score(labels, preds), "f1": precision_recall_fscore_support(labels, preds, average='weighted')[2]}
+
+training_args = TrainingArguments(
+    output_dir="./roberta-ft",
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    num_train_epochs=3,
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,
+    learning_rate=2e-5,
+    load_best_model_at_end=True,
+    metric_for_best_model="f1",
+    report_to=[]
+)
+
+trainer = Trainer(
+    model=model_ft,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    tokenizer=tokenizer_ft,
+    compute_metrics=compute_metrics
+)
+
+trainer.train()
+
+# Predictions
+predictions = trainer.predict(val_dataset)
+preds = predictions.predictions.argmax(axis=1)
+
+acc_ft = accuracy_score(predictions.label_ids, preds)
+prec_ft, rec_ft, f1_ft, _ = precision_recall_fscore_support(
+    predictions.label_ids, preds, average='weighted'
+)
+
+# -------------------------------
+# METRICS COMPARISON
+# -------------------------------
+def get_metrics(true, pred):
+    acc = accuracy_score(true, pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(true, pred, average='weighted')
+    return acc, prec, rec, f1
+
+# VADER
+acc_v, prec_v, rec_v, f1_v = get_metrics(df['True_Sentiment'], df['VADER_Sentiment'])
+
+# BASE ROBERTA
+acc_r, prec_r, rec_r, f1_r = get_metrics(df['True_Sentiment'], df['RoBERTa_Base'])
+
+print("\n=== MODEL COMPARISON ===")
+print("VADER ->", acc_v, prec_v, rec_v, f1_v)
+print("Base RoBERTa ->", acc_r, prec_r, rec_r, f1_r)
+print("Fine-tuned RoBERTa ->", acc_ft, prec_ft, rec_ft, f1_ft)
