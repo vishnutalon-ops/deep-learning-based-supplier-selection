@@ -1,0 +1,241 @@
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+
+MODEL_PATH = "./roberta-finetuned"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+
+sentiment_pipeline = pipeline(
+    "sentiment-analysis",
+    model=model,
+    tokenizer=tokenizer,
+    return_all_scores=True
+)
+from pathlib import Path
+
+MODEL_PATH = Path(r"C:\Users\VISHNU\roberta-finetuned")
+
+print("Path exists:", MODEL_PATH.exists())
+print("Is directory:", MODEL_PATH.is_dir())
+
+if MODEL_PATH.exists():
+    print("\nFiles inside model folder:")
+    for f in MODEL_PATH.iterdir():
+        print(" -", f.name)
+import torch
+from transformers import RobertaTokenizerFast, RobertaForSequenceClassification, pipeline
+from pathlib import Path
+
+MODEL_PATH = Path(r"C:\Users\VISHNU\roberta-finetuned")
+
+tokenizer = RobertaTokenizerFast.from_pretrained(MODEL_PATH)
+model = RobertaForSequenceClassification.from_pretrained(MODEL_PATH)
+
+sentiment_pipeline = pipeline(
+    "sentiment-analysis",
+    model=model,
+    tokenizer=tokenizer,
+    device=0 if torch.cuda.is_available() else -1
+)
+test_sentence = "The quality of the product is excellent but the price is high."
+
+print(sentiment_pipeline(test_sentence))
+print(model.config.id2label)
+# ==============================================================================
+# IMPORTS
+# ==============================================================================
+import pandas as pd
+import torch
+import re
+from pathlib import Path
+from transformers import (
+    RobertaTokenizerFast,
+    RobertaForSequenceClassification,
+    pipeline
+)
+from collections import defaultdict
+import matplotlib.pyplot as plt
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+CSV_FILE = r"datasetpath"
+MODEL_PATH = Path(r"modelpath")
+
+TEXT_COLUMN = "review_text"
+
+DEVICE = 0 if torch.cuda.is_available() else -1
+
+# --------- CRITERIA (AS REQUESTED) ----------
+TARGET_ASPECTS = {
+    "quality": [
+        "quality", "build", "material", "finish", "premium", "sturdy"
+    ],
+    "reliability": [
+        "reliable", "durable", "long lasting", "stable", "consistent"
+    ],
+    "features": [
+        "feature", "features", "function", "functions",
+        "option", "options", "technology"
+    ],
+    "performance": [
+        "performance", "speed", "efficiency", "output", "fast", "powerful"
+    ],
+    "price": [
+        "price", "cost", "worth", "value", "expensive", "cheap"
+    ]
+}
+
+SENTENCE_SPLIT_REGEX = r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s'
+
+# ==============================================================================
+# LOAD DATA
+# ==============================================================================
+
+def load_reviews(csv_file):
+    df = pd.read_csv(csv_file)
+    df.dropna(subset=[TEXT_COLUMN], inplace=True)
+    return df[TEXT_COLUMN].astype(str).tolist()
+
+# ==============================================================================
+# LOAD FINE-TUNED ROBERTA (BINARY)
+# ==============================================================================
+
+print("Loading fine-tuned RoBERTa model...")
+
+tokenizer = RobertaTokenizerFast.from_pretrained(MODEL_PATH)
+model = RobertaForSequenceClassification.from_pretrained(MODEL_PATH)
+
+sentiment_pipeline = pipeline(
+    "sentiment-analysis",
+    model=model,
+    tokenizer=tokenizer,
+    device=DEVICE,
+    return_all_scores=True
+)
+
+print("Model labels:", model.config.id2label)
+
+# LABEL_0 → Negative
+# LABEL_1 → Positive
+
+# ==============================================================================
+# SENTIMENT SCORING (BINARY SOFT POLARITY)
+# ==============================================================================
+
+def get_binary_polarity(sentence):
+    scores = sentiment_pipeline(sentence)[0]
+    score_dict = {s["label"]: s["score"] for s in scores}
+
+    negative = score_dict.get("LABEL_0", 0.0)
+    positive = score_dict.get("LABEL_1", 0.0)
+
+    return positive - negative   # range [-1, +1]
+
+# ==============================================================================
+# ASPECT-BASED ANALYSIS
+# ==============================================================================
+
+def analyze_aspects(reviews, aspects):
+    aspect_scores = defaultdict(list)
+
+    for review in reviews:
+        sentences = re.split(SENTENCE_SPLIT_REGEX, review.replace("\n", " "))
+
+        for sentence in sentences:
+            sentence_l = sentence.lower()
+            for aspect, keywords in aspects.items():
+                if any(k in sentence_l for k in keywords):
+                    try:
+                        polarity = get_binary_polarity(sentence)
+                        aspect_scores[aspect].append(polarity)
+                    except:
+                        pass
+
+    return aspect_scores
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+
+reviews = load_reviews(CSV_FILE)
+print(f"Total reviews loaded: {len(reviews)}")
+
+aspect_scores = analyze_aspects(reviews, TARGET_ASPECTS)
+
+# ==============================================================================
+# SUMMARY TABLE
+# ==============================================================================
+
+summary_data = []
+
+for aspect, scores in aspect_scores.items():
+    total = len(scores)
+
+    if total > 0:
+        pos = sum(1 for s in scores if s > 0)
+        neg = sum(1 for s in scores if s < 0)
+
+        summary_data.append({
+            "Aspect": aspect.capitalize(),
+            "Total Mentions": total,
+            "Positive (%)": (pos / total) * 100,
+            "Negative (%)": (neg / total) * 100,
+            "Net Polarity Score": (sum(scores) / total) * 100
+        })
+    else:
+        summary_data.append({
+            "Aspect": aspect.capitalize(),
+            "Total Mentions": 0,
+            "Positive (%)": 0.0,
+            "Negative (%)": 0.0,
+            "Net Polarity Score": 0.0
+        })
+
+summary_df = pd.DataFrame(summary_data).set_index("Aspect")
+
+print("\nFINAL ASPECT-BASED SENTIMENT SUMMARY\n")
+print(summary_df.round(2))
+
+# ==============================================================================
+# GRAPH 1 — NET POLARITY SCORE
+# ==============================================================================
+
+plt.figure(figsize=(10, 6))
+
+sorted_scores = summary_df["Net Polarity Score"].sort_values()
+colors = ["green" if x > 0 else "red" for x in sorted_scores]
+
+sorted_scores.plot(kind="barh", color=colors)
+plt.axvline(0, linestyle="--", color="gray")
+plt.title("Net Polarity Score by Criterion")
+plt.xlabel("Net Polarity Score")
+plt.tight_layout()
+plt.show()
+
+# ==============================================================================
+# GRAPH 2 — POSITIVE vs NEGATIVE DISTRIBUTION
+# ==============================================================================
+
+plt.figure(figsize=(10, 6))
+
+summary_df[["Positive (%)", "Negative (%)"]].plot(
+    kind="bar",
+    stacked=True,
+    color=["green", "red"],
+    ax=plt.gca()
+)
+
+plt.title("Aspect-Based Sentiment Distribution")
+plt.ylabel("Percentage")
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.show()
+OUTPUT_PATH = r"C:\Users\VISHNU\aspect_based_sentiment_summary1.xlsx"
+
+summary_df_rounded = summary_df.round(2)
+summary_df_rounded.to_excel(OUTPUT_PATH)
+
+print(f"Summary saved to: {OUTPUT_PATH}")
+
